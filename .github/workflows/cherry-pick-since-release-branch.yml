@@ -110,7 +110,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Create PR to branch
-        uses: risingwavelabs/github-action-cherry-pick@master
+        uses: risingwavelabs/github-action-cherry-pick@feat-assign-issue-copilot
         with:
           # For automatic trigger from PR events, `pr_sha` is unset,
           # and it will use the triggering SHA (GITHUB_SHA) instead.
