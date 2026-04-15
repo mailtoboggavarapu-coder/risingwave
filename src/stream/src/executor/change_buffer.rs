@@ -339,27 +339,25 @@ impl<L> ChangeBufferStateWriter<L>
 where
     L: LocalStateStoreReadLog,
 {
-    async fn into_change_log_chunks(
-        &self,
-        chunk_size: usize,
-    ) -> StreamExecutorResult<Vec<StreamChunk>> {
+    #[try_stream(ok = StreamChunk, error = StreamExecutorError)]
+    async fn into_change_log_chunks(&self, chunk_size: usize) {
         if !self.dirty {
-            return Ok(vec![]);
+            return Ok(());
         }
 
         let mut iter = self.local_state_store.iter_uncommitted_log().await?;
         let mut builder = StreamChunkBuilder::new(chunk_size, self.serde.data_types.clone());
-        let mut chunks = Vec::new();
 
         while let Some((_key, change)) = iter.try_next().await? {
             let record = self.serde.record_from_change_log(change)?;
             if let Some(chunk) = builder.append_record(record) {
-                chunks.push(chunk);
+                yield chunk;
             }
         }
 
-        chunks.extend(builder.take());
-        Ok(chunks)
+        if let Some(chunk) = builder.take() {
+            yield chunk;
+        }
     }
 }
 
@@ -436,12 +434,12 @@ where
                     writer.spill_buffer(&mut buffer)?;
                     writer.flush().await?;
 
-                    let current_epoch_chunks = writer.into_change_log_chunks(chunk_size).await?;
+                    #[for_await]
+                    for chunk in writer.into_change_log_chunks(chunk_size) {
+                        yield Message::Chunk(chunk?);
+                    }
                     writer.seal_current_epoch(barrier.epoch.curr)?;
 
-                    for chunk in current_epoch_chunks {
-                        yield Message::Chunk(chunk);
-                    }
                     yield Message::Barrier(barrier);
                 }
                 Message::Watermark(watermark) => {
@@ -514,7 +512,7 @@ fn get_dist_key_in_pk_indices(
 
 #[cfg(test)]
 mod tests {
-    use risingwave_common::array::StreamChunkTestExt;
+    use risingwave_common::array::{StreamChunk, StreamChunkTestExt};
 
     use super::EpochChunkBuffer;
 
@@ -524,7 +522,8 @@ mod tests {
         buffer.push_chunk(StreamChunk::from_pretty(" I\n + 1"));
         buffer.push_chunk(StreamChunk::from_pretty(" I\n + 2\n + 3"));
 
-        assert!(buffer.exceeds(3));
+        assert!(buffer.exceeds(2));
+        assert!(!buffer.exceeds(3));
         assert!(!buffer.is_empty());
 
         let chunks = buffer.drain().collect::<Vec<_>>();
