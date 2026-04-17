@@ -512,9 +512,77 @@ fn get_dist_key_in_pk_indices(
 
 #[cfg(test)]
 mod tests {
-    use risingwave_common::array::{StreamChunk, StreamChunkTestExt};
+    use std::collections::HashSet;
+    use std::sync::Arc;
 
-    use super::EpochChunkBuffer;
+    use futures::TryStreamExt;
+    use risingwave_common::array::{StreamChunk, StreamChunkTestExt};
+    use risingwave_common::bitmap::Bitmap;
+    use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, Schema, TableId};
+    use risingwave_common::hash::VirtualNode;
+    use risingwave_common::types::DataType;
+    use risingwave_common::util::epoch::{EpochExt, EpochPair};
+    use risingwave_common::util::sort_util::OrderType;
+    use risingwave_hummock_test::test_utils::prepare_hummock_test_env;
+    use risingwave_pb::catalog::Table;
+    use risingwave_storage::StateStore;
+
+    use super::{
+        ChangeBufferExecutor, ChangeBufferStateWriter, EpochChunkBuffer, create_epoch_writer,
+    };
+    use crate::common::table::test_utils::gen_pbtable_with_dist_key;
+    use crate::executor::test_utils::{MockSource, StreamExecutorTestExt};
+    use crate::executor::{ActorContext, ActorContextRef, Barrier, Execute, Message, StreamKey};
+
+    fn gen_change_buffer_table(table_id: TableId) -> Table {
+        gen_pbtable_with_dist_key(
+            table_id,
+            vec![
+                ColumnDesc::unnamed(ColumnId::from(0), DataType::Int32),
+                ColumnDesc::unnamed(ColumnId::from(1), DataType::Int32),
+            ],
+            vec![OrderType::ascending()],
+            vec![0],
+            1,
+            vec![0],
+        )
+    }
+
+    async fn prepare_hummock_writer(
+        actor_context: &ActorContextRef,
+        table: &Table,
+    ) -> (
+        risingwave_hummock_test::test_utils::HummockTestEnv,
+        Arc<Bitmap>,
+        u64,
+        ChangeBufferStateWriter<<risingwave_storage::hummock::HummockStorage as StateStore>::Local>,
+    ) {
+        let test_env = prepare_hummock_test_env().await;
+        test_env.register_table(table.clone()).await;
+
+        let vnodes = Arc::new(Bitmap::ones(VirtualNode::COUNT_FOR_TEST));
+        let epoch = test_env
+            .storage
+            .get_pinned_version()
+            .table_committed_epoch(table.id)
+            .unwrap()
+            .next_epoch();
+        test_env
+            .storage
+            .start_epoch(epoch, HashSet::from_iter([table.id]));
+
+        let writer = create_epoch_writer(
+            &test_env.storage,
+            actor_context,
+            table,
+            vnodes.clone(),
+            EpochPair::new_test_epoch(epoch),
+        )
+        .await
+        .unwrap();
+
+        (test_env, vnodes, epoch, writer)
+    }
 
     #[test]
     fn test_epoch_chunk_buffer_tracks_rows() {
@@ -530,5 +598,110 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert!(!buffer.exceeds(1));
         assert!(buffer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_state_writer_reads_pending_imms_from_shared_buffer() {
+        let actor_context = ActorContext::for_test(0);
+        let table = gen_change_buffer_table(TableId::new(233));
+        let (_test_env, _vnodes, _curr_epoch, mut writer) =
+            prepare_hummock_writer(&actor_context, &table).await;
+
+        writer
+            .write_chunk(&StreamChunk::from_pretty(
+                " i i
+                + 1 10
+                + 2 20",
+            ))
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        writer
+            .write_chunk(&StreamChunk::from_pretty(
+                " i i
+                U- 1 10
+                U+ 1 11
+                - 2 20
+                + 3 30",
+            ))
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        let read_version = writer.local_state_store.read_version();
+        let staging = read_version.read();
+        assert_eq!(2, staging.staging().pending_imms.len());
+        assert!(staging.staging().uploading_imms.is_empty());
+
+        let chunks: Vec<_> = writer
+            .into_change_log_chunks(1024)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks.into_iter().next().unwrap().compact_vis(),
+            StreamChunk::from_pretty(
+                " i i
+                + 1 11
+                + 3 30"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_change_buffer_executor_emits_changes_from_shared_buffer_imms() {
+        let actor_context = ActorContext::for_test(0);
+        let table = gen_change_buffer_table(TableId::new(234));
+        let (test_env, vnodes, curr_epoch, writer) =
+            prepare_hummock_writer(&actor_context, &table).await;
+        drop(writer);
+        let next_epoch = curr_epoch.next_epoch();
+        test_env
+            .storage
+            .start_epoch(next_epoch, HashSet::from_iter([table.id]));
+
+        let schema = Schema::new(vec![
+            Field::unnamed(DataType::Int32),
+            Field::unnamed(DataType::Int32),
+        ]);
+        let source = MockSource::with_messages(vec![
+            Message::Barrier(Barrier::new_test_barrier(curr_epoch)),
+            Message::Chunk(StreamChunk::from_pretty(
+                " i i
+                + 1 10
+                + 2 20",
+            )),
+            Message::Chunk(StreamChunk::from_pretty(
+                " i i
+                U- 1 10
+                U+ 1 11
+                - 2 20
+                + 3 30",
+            )),
+            Message::Barrier(Barrier::new_test_barrier(next_epoch)),
+        ])
+        .into_executor(schema, StreamKey::from(vec![0]));
+
+        let mut executor = ChangeBufferExecutor::new(
+            actor_context,
+            source,
+            test_env.storage.clone(),
+            table,
+            vnodes,
+            1,
+        )
+        .boxed()
+        .execute();
+
+        assert_eq!(executor.expect_barrier().await.epoch.curr, curr_epoch);
+        assert_eq!(
+            executor.expect_chunk().await.compact_vis(),
+            StreamChunk::from_pretty(
+                " i i
+                + 1 11
+                + 3 30"
+            )
+        );
+        assert_eq!(executor.expect_barrier().await.epoch.curr, next_epoch);
     }
 }
